@@ -83,6 +83,10 @@ def main(args):
             visualizers[robot_idx].draw(pose)
             if args.debug and 'debug_data' in data:
                 debug_visualizer.draw_debug_data(data['debug_data'])
+        poses = data['poses']
+        if poses:
+            parts = [f'R{idx}: ({p[0]:.2f}, {p[1]:.2f}, {math.degrees(p[2]):.2f}°)' for idx, p in sorted(poses.items())]
+            plt.figure('Robots').canvas.manager.set_window_title('Robots  ' + '  '.join(parts))
         plt.pause(0.001)  # 15 ms
 
         if args.benchmark:

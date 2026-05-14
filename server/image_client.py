@@ -33,8 +33,10 @@ class CameraClientWrapper:
         return cv.warpPerspective(self.camera_client.get_image(), self.transformation_matrix, (self.image_width, self.image_height))
 
 class ImageClient:
-    def __init__(self, top_only=False, port1=6000, port2=6001, scale_factor=1.0):
-        if top_only:
+    def __init__(self, top_only=False, bottom_only=False, port1=6000, port2=6001, scale_factor=1.0):
+        if bottom_only:
+            self.cameras = [CameraClientWrapper(CAMERA_SERIALS[1], port2, scale_factor=scale_factor)]
+        elif top_only:
             self.cameras = [CameraClientWrapper(CAMERA_SERIALS[0], port1, scale_factor=scale_factor)]
         else:
             self.cameras = [CameraClientWrapper(CAMERA_SERIALS[0], port1, scale_factor=scale_factor), CameraClientWrapper(CAMERA_SERIALS[1], port2, scale_factor=scale_factor)]
@@ -50,7 +52,7 @@ class ImageClient:
             camera.camera_client.close()
 
 def main(args):
-    image_client = ImageClient(top_only=args.top_only, port1=args.port1, port2=args.port2, scale_factor=args.scale_factor)
+    image_client = ImageClient(top_only=args.top_only, bottom_only=args.bottom_only, port1=args.port1, port2=args.port2, scale_factor=args.scale_factor)
     window_name = 'out'
 
     try:
@@ -82,6 +84,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--top-only', action='store_true')
+    parser.add_argument('--bottom-only', action='store_true')
     parser.add_argument('--port1', type=int, default=6000)
     parser.add_argument('--port2', type=int, default=6001)
     parser.add_argument('--scale-factor', type=float, default=0.35)

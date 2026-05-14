@@ -13,7 +13,7 @@ def main(serial):
     cap = utils.get_video_cap(serial, image_width, image_height)
 
     # Set up aruco dict
-    aruco_dict = cv.aruco.Dictionary_get(MARKER_DICT_ID)
+    aruco_dict = cv.aruco.getPredefinedDictionary(MARKER_DICT_ID)
 
     window_name = 'out'
     cv.namedWindow(window_name)

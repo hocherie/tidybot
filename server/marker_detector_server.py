@@ -14,18 +14,9 @@ from camera_server import CameraServer
 from constants import CAMERA_SERIALS
 from publisher import Publisher
 
-def get_angle_offsets():
-    corners = [(0, 1), (1, 1), (1, 0), (0, 0)]
-    offsets = {}
-    for i, corner1 in enumerate(corners):
-        for j, corner2 in enumerate(corners):
-            if i != j:
-                offsets[(i, j)] = -math.atan2(corner2[1] - corner1[1], corner2[0] - corner1[0])
-    return offsets
-
 class Detector:
     def __init__(self, placement, serial, port):
-        assert placement in {'top', 'bottom', 'top_only'}
+        assert placement in {'top', 'bottom', 'top_only', 'bottom_only'}
         self.placement = placement
 
         # Camera
@@ -34,19 +25,19 @@ class Detector:
 
         # Aruco marker detection
         cv.setNumThreads(4)  # Based on 12 CPUs
-        self.marker_dict = cv.aruco.Dictionary_get(constants.MARKER_DICT_ID)
+        self.marker_dict = cv.aruco.getPredefinedDictionary(constants.MARKER_DICT_ID)
         self.marker_dict.bytesList = self.marker_dict.bytesList[constants.MARKER_IDS]
 
         # Reduce false positives
-        self.detector_params = cv.aruco.DetectorParameters_create()
+        self.detector_params = cv.aruco.DetectorParameters()
         self.detector_params.minCornerDistanceRate = 0.2  # Marker detections should be fronto-parallel
         self.detector_params.adaptiveThreshWinSizeMin = 23  # Use single thresholding step with window size 23 since all markers are the same size
 
         # Pose transformation
         self.transformation_matrix = self.compute_transformation_matrix(np.array(self.camera_corners, dtype=np.float32))
         self.height_ratio = (constants.CAMERA_HEIGHT - constants.ROBOT_HEIGHT) / constants.CAMERA_HEIGHT
-        self.angle_offsets = get_angle_offsets()
         self.position_offset = constants.ROBOT_DIAG / 2 - constants.MARKER_PARAMS['sticker_length'] / math.sqrt(2)
+        self.marker_template = self._compute_marker_template()
 
     def compute_transformation_matrix(self, src_points):
         if self.placement == 'top':
@@ -71,8 +62,39 @@ class Detector:
                 [constants.FLOOR_WIDTH / 2, -(constants.FLOOR_LENGTH / 4)],
                 [-(constants.FLOOR_WIDTH / 2), -(constants.FLOOR_LENGTH / 4)],
             ], dtype=np.float32)
+        elif self.placement == 'bottom_only':
+            dst_points = np.array([
+                [-(constants.FLOOR_WIDTH / 2), constants.FLOOR_LENGTH / 2],
+                [constants.FLOOR_WIDTH / 2, constants.FLOOR_LENGTH / 2],
+                [constants.FLOOR_WIDTH / 2, -(constants.FLOOR_LENGTH / 2)],
+                [-(constants.FLOOR_WIDTH / 2), -(constants.FLOOR_LENGTH / 2)],
+            ], dtype=np.float32)
 
         return cv.getPerspectiveTransform(src_points, dst_points).astype(np.float32)
+
+    def _compute_marker_template(self):
+        center_to_marker = np.radians([135, 45, -45, -135], dtype=np.float64)
+        template = np.column_stack([
+            self.position_offset * np.cos(center_to_marker),
+            self.position_offset * np.sin(center_to_marker),
+        ])
+        return template
+
+    def _rigid_body_fit(self, template_points, observed_points):
+        # Closed-form least-squares rigid body fit (Kabsch algorithm)
+        # Solves for optimal rotation + translation: observed = R @ template + t
+        centroid_template = template_points.mean(axis=0)
+        centroid_observed = observed_points.mean(axis=0)
+        P = template_points - centroid_template
+        Q = observed_points - centroid_observed
+        H = P.T @ Q
+        U, _, Vt = np.linalg.svd(H)
+        d = np.linalg.det(Vt.T @ U.T)
+        S = np.array([[1, 0], [0, d]])
+        R = Vt.T @ S @ U.T
+        t = centroid_observed - R @ centroid_template
+        heading = math.atan2(R[1, 0], R[0, 0])
+        return t[0], t[1], heading
 
     def get_poses_from_markers(self, corners, indices, debug=False):
         data = {'poses': {}, 'single_marker_robots': set()}
@@ -90,7 +112,7 @@ class Detector:
         # Compute marker positions
         centers = corners.mean(axis=1)
 
-        # Compute marker headings, making sure to deal with wraparound
+        # Compute marker headings for single-marker fallback
         diffs = (corners - centers.reshape(-1, 1, 2)).reshape(-1, 2)
         angles = np.arctan2(diffs[:, 1], diffs[:, 0]).reshape(-1, 4) + np.radians([-135, -45, 45, 135], dtype=np.float32)
         angles1 = np.mod(angles + math.pi, 2 * math.pi) - math.pi
@@ -100,8 +122,7 @@ class Detector:
             angles1.mean(axis=1),
             np.mod(angles2.mean(axis=1) + math.pi, 2 * math.pi) - math.pi)
 
-        # Compute robot poses using marker centers
-        positions = centers.copy()
+        # Compute robot poses
         indices = indices.squeeze(1)
         robot_indices = np.floor_divide(indices, 4)
         for robot_idx in np.unique(robot_indices):
@@ -109,45 +130,33 @@ class Detector:
             robot_mask = robot_indices == robot_idx
             indices_robot = np.mod(indices[robot_mask], 4)
             centers_robot = centers[robot_mask]
-            positions_robot = centers_robot.copy()
 
-            # Compute robot heading
             single_marker = robot_mask.sum() == 1
             if single_marker:
-                # Use heading of the single visible marker
                 heading = headings[robot_mask].item()
+                angle = heading + np.radians([-45, -135, 135, 45], dtype=np.float32)[indices_robot[0]]
+                position = centers_robot[0].copy()
+                position[0] += self.position_offset * np.cos(angle)
+                position[1] += self.position_offset * np.sin(angle)
             else:
-                # Compute heading using pairs of marker centers
-                headings_robot = []
-                for i, idx1 in enumerate(indices_robot):
-                    for j, idx2 in enumerate(indices_robot):
-                        if j <= i:
-                            continue
-                        if idx1 == idx2:  # Caused by false positives
-                            continue
-                        dx = centers_robot[j][0] - centers_robot[i][0]
-                        dy = centers_robot[j][1] - centers_robot[i][1]
-                        heading = math.atan2(dy, dx) + self.angle_offsets[(idx1, idx2)]
-                        heading = (heading + math.pi) % (2 * math.pi) - math.pi
-                        headings_robot.append(heading)
-                if len(headings_robot) == 0:  # Caused by false positives
-                    continue
-                heading = np.array(headings_robot, dtype=np.float32).mean()
+                # Rigid-body fit of known marker template to observed positions
+                template_subset = self.marker_template[indices_robot]
+                observed = centers_robot.astype(np.float64)
+                x, y, heading = self._rigid_body_fit(template_subset, observed)
+                position = np.array([x, y], dtype=np.float32)
 
-            # Compute robot position using marker position offsets
-            angles = heading + np.radians([-45, -135, 135, 45], dtype=np.float32)[indices_robot]
-            positions_robot[:, 0] += self.position_offset * np.cos(angles)
-            positions_robot[:, 1] += self.position_offset * np.sin(angles)
-            position = positions_robot.mean(axis=0)
-            positions[robot_mask] = positions_robot
-
-            # Store robot pose
             data['poses'][robot_idx] = (position[0], position[1], heading)
             if single_marker:
                 data['single_marker_robots'].add(robot_idx)
 
         if debug:
-            data['debug_data'] = list(zip(indices.tolist(), centers.tolist(), positions.tolist()))
+            positions_debug = centers.copy()
+            for i, idx in enumerate(indices):
+                robot_idx = idx // 4
+                if robot_idx in data['poses']:
+                    px, py, _ = data['poses'][robot_idx]
+                    positions_debug[i] = [px, py]
+            data['debug_data'] = list(zip(indices.tolist(), centers.tolist(), positions_debug.tolist()))
 
         return data
 
@@ -166,10 +175,12 @@ class Detector:
         return self.get_poses_from_markers(corners, indices, debug=debug)
 
 class MarkerDetectorServer(Publisher):
-    def __init__(self, hostname='localhost', port=6002, top_only=False, debug=False):
+    def __init__(self, hostname='localhost', port=6002, top_only=False, bottom_only=False, debug=False):
         super().__init__(hostname=hostname, port=port)
         self.debug = debug
-        if top_only:
+        if bottom_only:
+            self.detectors = [Detector('bottom_only', CAMERA_SERIALS[1], 6001)]
+        elif top_only:
             self.detectors = [Detector('top_only', CAMERA_SERIALS[0], 6000)]
         else:
             self.detectors = [Detector('top', CAMERA_SERIALS[0], 6000), Detector('bottom', CAMERA_SERIALS[1], 6001)]
@@ -199,19 +210,24 @@ def main(args):
     # Start camera servers
     def start_camera_server(serial, port):
         CameraServer(serial, port=port).run()
-    for serial, port in [(CAMERA_SERIALS[0], 6000), (CAMERA_SERIALS[1], 6001)]:
+    if args.bottom_only:
+        cameras = [(CAMERA_SERIALS[1], 6001)]
+    elif args.top_only:
+        cameras = [(CAMERA_SERIALS[0], 6000)]
+    else:
+        cameras = [(CAMERA_SERIALS[0], 6000), (CAMERA_SERIALS[1], 6001)]
+    for serial, port in cameras:
         Process(target=start_camera_server, args=(serial, port), daemon=True).start()
-        if args.top_only:
-            break
 
     # Wait for camera servers to be ready
     time.sleep(1.5)
 
     # Start marker detector server
-    MarkerDetectorServer(top_only=args.top_only, debug=args.debug).run()
+    MarkerDetectorServer(top_only=args.top_only, bottom_only=args.bottom_only, debug=args.debug).run()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--top-only', action='store_true')
+    parser.add_argument('--bottom-only', action='store_true')
     parser.add_argument('--debug', action='store_true')
     main(parser.parse_args())
